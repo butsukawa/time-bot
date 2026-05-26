@@ -137,9 +137,14 @@ async def create_report_data(user, title_prefix, is_periodic=False):
     total_today_sec = sum(today_status.values())
     efficiency = (total_today_sec / avg_total_until_now_sec * 100) if avg_total_until_now_sec > 0 else 0
 
-    # ================= 変更点: グラフ描画 (日本語対応) =================
-    # fontsフォルダ内のフォントを読み込む
-    font_path = "fonts/ZenKakuGothicAntique-Regular.ttf"
+    # ================= 変更点: グラフ描画 (日本語対応・新しいフォント名に修正) =================
+    from matplotlib import font_manager
+    import os
+
+    # main.py の場所を基準にして、新しいフォントファイルへの絶対パスを作る
+    base_dir = os.path.dirname(__file__)
+    font_path = os.path.join(base_dir, "fonts", "ZenKakuGothicAntique-Regular.ttf") # 👈 ここを新しいファイル名に変更！
+    
     jp_font = font_manager.FontProperties(fname=font_path)
 
     plt.style.use('dark_background')
