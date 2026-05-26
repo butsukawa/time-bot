@@ -12,6 +12,7 @@ from googleapiclient.discovery import build
 import gspread
 from flask import Flask
 from threading import Thread
+from matplotlib import font_manager
 
 # --- Flask ---
 app = Flask('')
@@ -106,13 +107,11 @@ async def create_report_data(user, title_prefix, is_periodic=False):
     user_key = f"{user.id}"
     report_counts[user_key] = report_counts.get(user_key, 0) + 1
     current_count = report_counts[user_key]
-    # キャッシュ対策のため実行ごとにユニークな名前を生成
     filename = f"analysis_{user.id}_{'auto' if is_periodic else 'manual'}_{current_count}.png"
 
     # --- データ取得ロジック ---
     today_hourly, today_status, _ = await get_activity_data_from_calendar(today_start, now, user.id)
     
-    # 現在進行中のステータスをリアルタイム反映
     if user.id in user_status_start:
         info = user_status_start[user.id]
         st_eng = {"online": "Online", "idle": "Idle", "dnd": "DND"}.get(info['status'])
@@ -134,12 +133,15 @@ async def create_report_data(user, title_prefix, is_periodic=False):
     divisor = 14
     avg_hourly = {i: (hist_hourly_total[i] / divisor) for i in range(24)}
     
-    # 【正確な分析】現在時刻までの「平均累計」を算出
     avg_total_until_now_sec = sum(avg_hourly[i] for i in range(now.hour + 1)) 
     total_today_sec = sum(today_status.values())
     efficiency = (total_today_sec / avg_total_until_now_sec * 100) if avg_total_until_now_sec > 0 else 0
 
-    # --- グラフ描画 (ここだけ英語) ---
+    # ================= 変更点: グラフ描画 (日本語対応) =================
+    # fontsフォルダ内のフォントを読み込む
+    font_path = "fonts/ZenKakuGothicAntique-Regular.ttf"
+    jp_font = font_manager.FontProperties(fname=font_path)
+
     plt.style.use('dark_background')
     fig, ax = plt.subplots(figsize=(10, 5), facecolor='#0b0e14')
     ax.set_facecolor('#0b0e14')
@@ -148,14 +150,14 @@ async def create_report_data(user, title_prefix, is_periodic=False):
     today_min = [today_hourly[i]/60 for i in hours]
     avg_min = [avg_hourly[i]/60 for i in hours]
 
-    # Bar: Today / Line: 14-Day Avg
-    ax.bar(hours, today_min, color='#5865F2', label='Today', width=0.7, alpha=0.8, zorder=3)
-    ax.plot(hours, avg_min, color='#FEE75C', marker='o', label='14-Day Average', linewidth=2, markersize=4, zorder=4)
+    # ラベルを日本語に変更
+    ax.bar(hours, today_min, color='#5865F2', label='今日', width=0.7, alpha=0.8, zorder=3)
+    ax.plot(hours, avg_min, color='#FEE75C', marker='o', label='14日間の平均', linewidth=2, markersize=4, zorder=4)
     
-    # グラフ内テキストを英語に設定
-    ax.set_title(f"Activity Analysis: @{user.name}", color='white', pad=20, fontsize=15, fontweight='bold')
-    ax.set_xlabel("Hour of Day (24h)", color='#b9bbbe', fontsize=10)
-    ax.set_ylabel("Duration (Minutes)", color='#b9bbbe', fontsize=10)
+    # グラフ内テキストの日本語化とフォント適用
+    ax.set_title(f"アクティビティ分析: @{user.name}", color='white', pad=20, fontsize=15, fontweight='bold', fontproperties=jp_font)
+    ax.set_xlabel("時間軸 (24時間)", color='#b9bbbe', fontsize=10, fontproperties=jp_font)
+    ax.set_ylabel("活動時間 (分)", color='#b9bbbe', fontsize=10, fontproperties=jp_font)
     
     ax.set_xticks(hours)
     ax.tick_params(axis='both', colors='#b9bbbe', labelsize=9)
@@ -164,8 +166,10 @@ async def create_report_data(user, title_prefix, is_periodic=False):
     for spine in ax.spines.values():
         spine.set_visible(False)
     
-    ax.legend(frameon=False, loc='upper left', fontsize=9)
-    
+    # 凡例へのフォント適用
+    ax.legend(frameon=False, loc='upper left', fontsize=9, prop=jp_font)
+    # =================================================================
+
     buf = io.BytesIO()
     plt.savefig(buf, format='png', facecolor='#0b0e14', bbox_inches='tight', dpi=120)
     buf.seek(0)
@@ -174,7 +178,6 @@ async def create_report_data(user, title_prefix, is_periodic=False):
     # --- Embed構成 (ここは日本語) ---
     embed = discord.Embed(title=title_prefix, color=0x5865F2, timestamp=now)
     
-    # 効率の判定
     eff_emoji = "🔥" if efficiency > 110 else "💤" if efficiency < 50 else "📊"
     
     embed.add_field(name="📈 活動効率", value=f"同時刻の14日平均に対して **{efficiency:.1f}%** {eff_emoji}", inline=False)
