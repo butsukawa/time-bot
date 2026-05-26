@@ -98,7 +98,6 @@ async def get_activity_data_from_calendar(start_dt, end_dt, user_id):
         
 # --- カウント管理用の辞書をグローバルに定義 ---
 report_counts = {}
-
 async def create_report_data(user, title_prefix, is_periodic=False):
     now = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=9)))
     today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
@@ -139,15 +138,15 @@ async def create_report_data(user, title_prefix, is_periodic=False):
     total_today_sec = sum(today_status.values())
     efficiency = (total_today_sec / avg_total_until_now_sec * 100) if avg_total_until_now_sec > 0 else 0
 
-    # ================= 変更点: 新しい日本語フォントの読み込み =================
+    # ================= 変更点: font.ttf を同じ階層から直接読み込む =================
     from matplotlib import font_manager
     import os
 
-    # main.pyの位置を基準に、fonts/ZenKakuGothicAntique-Regular.ttf の絶対パスを生成
+    # main.py と同じ場所にある "font.ttf" の絶対パスを生成
     base_dir = os.path.dirname(__file__)
-    font_path = os.path.join(base_dir, "fonts", "ZenKakuGothicAntique-Regular.ttf")
+    font_path = os.path.join(base_dir, "font.ttf")
     
-    # フォントプロパティの設定
+    # フォントの読み込み
     jp_font = font_manager.FontProperties(fname=font_path)
     # =========================================================================
 
@@ -160,11 +159,9 @@ async def create_report_data(user, title_prefix, is_periodic=False):
     today_min = [today_hourly[i]/60 for i in hours]
     avg_min = [avg_hourly[i]/60 for i in hours]
 
-    # バーとラインのラベルを日本語化
     ax.bar(hours, today_min, color='#5865F2', label='今日', width=0.7, alpha=0.8, zorder=3)
     ax.plot(hours, avg_min, color='#FEE75C', marker='o', label='14日間の平均', linewidth=2, markersize=4, zorder=4)
     
-    # 各テキストに fontproperties=jp_font を適用して日本語化
     ax.set_title(f"アクティビティ分析: @{user.name}", color='white', pad=20, fontsize=15, fontweight='bold', fontproperties=jp_font)
     ax.set_xlabel("時間軸 (24時間)", color='#b9bbbe', fontsize=10, fontproperties=jp_font)
     ax.set_ylabel("活動時間 (分)", color='#b9bbbe', fontsize=10, fontproperties=jp_font)
@@ -176,7 +173,6 @@ async def create_report_data(user, title_prefix, is_periodic=False):
     for spine in ax.spines.values():
         spine.set_visible(False)
     
-    # 凡例（Legend）にも日本語フォントを適用 (凡例のみ prop= になる点に注意)
     ax.legend(frameon=False, loc='upper left', fontsize=9, prop=jp_font)
     
     buf = io.BytesIO()
@@ -184,10 +180,9 @@ async def create_report_data(user, title_prefix, is_periodic=False):
     buf.seek(0)
     plt.close()
 
-    # --- Embed構成 (ここは日本語) ---
+    # --- Embed構成 ---
     embed = discord.Embed(title=title_prefix, color=0x5865F2, timestamp=now)
     
-    # 効率の判定
     eff_emoji = "🔥" if efficiency > 110 else "💤" if efficiency < 50 else "📊"
     
     embed.add_field(name="📈 活動効率", value=f"同時刻の14日平均に対して **{efficiency:.1f}%** {eff_emoji}", inline=False)
@@ -230,15 +225,15 @@ async def on_ready():
 
 @bot.event
 async def on_presence_update(before, after):
-    # ボット自身や、ステータスに変化がない場合は無視
     if after.bot or before.status == after.status:
         return
 
     now = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=9)))
+    current_status_str = str(after.status).lower() # 小文字にして統一
     
-    # --- カレンダー記録ロジック (現状維持) ---
+    # --- カレンダー記録ロジック ---
     prev = user_status_start.get(after.id)
-    user_status_start[after.id] = {'status': str(after.status), 'time': now}
+    user_status_start[after.id] = {'status': current_status_str, 'time': now}
     
     if prev:
         dur = (now - prev['time']).total_seconds()
@@ -256,7 +251,7 @@ async def on_presence_update(before, after):
             except Exception as e: 
                 print(f"❌ カレンダー記録失敗: {e}")
 
-    # --- ステータス通知送信ロジック (改善版) ---
+    # --- ステータス通知送信ロジック ---
     st_d = {
         "online": "🟢 **オンライン**", 
         "idle": "🌙 **退席中**", 
@@ -265,12 +260,10 @@ async def on_presence_update(before, after):
     }
 
     for guild in bot.guilds:
-        # スプレッドシートから読み込んだ設定があるか確認
         c_id = user_configs.get(f"{after.id}-{guild.id}")
         if not c_id: 
             continue
         
-        # 短時間の連投防止 (3秒以内の連続変化は無視)
         lock_key = f"{after.id}-{guild.id}"
         if lock_key in last_notifications and (now - last_notifications[lock_key]).total_seconds() < 3: 
             continue
@@ -280,9 +273,8 @@ async def on_presence_update(before, after):
         
         if channel:
             try:
-                # 前回のステータスも含めて送ると分かりやすい
-                old_st = st_d.get(str(before.status), "⚪ オフライン")
-                new_st = st_d.get(str(after.status), "⚪ オフライン")
+                old_st = st_d.get(str(before.status).lower(), "⚪ オフライン")
+                new_st = st_d.get(current_status_str, "⚪ オフライン")
                 await channel.send(f"🔔 **{after.display_name}**： {old_st} ➡ {new_st}")
             except discord.Forbidden:
                 print(f"⚠️ 権限不足: {guild.name} の {channel.name} でメッセージが送れません")
@@ -306,16 +298,27 @@ async def register(interaction: discord.Interaction, user: discord.Member, chann
 async def status(interaction: discord.Interaction, member: discord.Member = None):
     target = member or interaction.user
     now = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=9)))
+    
     c_map = {"online": 0x57F287, "idle": 0xFEE75C, "dnd": 0xED4245, "offline": 0x95A5A6}
     l_map = {"online": "🟢 オンライン", "idle": "🌙 退席中", "dnd": "⛔ 取り込み中", "offline": "⚪ オフライン"}
-    embed = discord.Embed(title=f"Status: {target.display_name}", color=c_map.get(str(target.status), 0x95A5A6))
-    embed.add_field(name="現在", value=l_map.get(str(target.status), "⚪ オフライン"), inline=True)
+    
+    # 変更点: メモリにデータが無い場合は Discord が検知している現在のステータスをそのまま文字列として使う
+    if target.id in user_status_start:
+        current_status_str = user_status_start[target.id]['status']
+    else:
+        current_status_str = str(target.status)
+        
+    embed = discord.Embed(title=f"Status: {target.display_name}", color=c_map.get(current_status_str, 0x95A5A6))
+    embed.add_field(name="現在", value=l_map.get(current_status_str, "⚪ オフライン"), inline=True)
+    
     if target.id in user_status_start:
         info = user_status_start[target.id]
         embed.add_field(name="開始時刻", value=info['time'].strftime("%H:%M:%S"), inline=True)
         embed.add_field(name="継続時間", value=format_time_jp((now - info['time']).total_seconds()), inline=False)
+    else:
+        embed.add_field(name="開始時刻", value="記録なし (ボット起動後の変化未検知)", inline=True)
+        
     await interaction.response.send_message(embed=embed)
-
 @bot.tree.command(name="report", description="レポート作成")
 async def report(interaction: discord.Interaction, member: discord.Member = None):
     # ★ここが重要：関数の「一番最初」に持ってくる
