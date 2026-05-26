@@ -112,6 +112,7 @@ async def create_report_data(user, title_prefix, is_periodic=False):
     # --- データ取得ロジック ---
     today_hourly, today_status, _ = await get_activity_data_from_calendar(today_start, now, user.id)
     
+    # 現在進行中のステータスをリアルタイム反映
     if user.id in user_status_start:
         info = user_status_start[user.id]
         st_eng = {"online": "Online", "idle": "Idle", "dnd": "DND"}.get(info['status'])
@@ -133,20 +134,24 @@ async def create_report_data(user, title_prefix, is_periodic=False):
     divisor = 14
     avg_hourly = {i: (hist_hourly_total[i] / divisor) for i in range(24)}
     
+    # 【正確な分析】現在時刻までの「平均累計」を算出
     avg_total_until_now_sec = sum(avg_hourly[i] for i in range(now.hour + 1)) 
     total_today_sec = sum(today_status.values())
     efficiency = (total_today_sec / avg_total_until_now_sec * 100) if avg_total_until_now_sec > 0 else 0
 
-    # ================= 変更点: グラフ描画 (日本語対応・新しいフォント名に修正) =================
+    # ================= 変更点: 新しい日本語フォントの読み込み =================
     from matplotlib import font_manager
     import os
 
-    # main.py の場所を基準にして、新しいフォントファイルへの絶対パスを作る
+    # main.pyの位置を基準に、fonts/ZenKakuGothicAntique-Regular.ttf の絶対パスを生成
     base_dir = os.path.dirname(__file__)
-    font_path = os.path.join(base_dir, "fonts", "ZenKakuGothicAntique-Regular.ttf") # 👈 ここを新しいファイル名に変更！
+    font_path = os.path.join(base_dir, "fonts", "ZenKakuGothicAntique-Regular.ttf")
     
+    # フォントプロパティの設定
     jp_font = font_manager.FontProperties(fname=font_path)
+    # =========================================================================
 
+    # --- グラフ描画 (日本語対応版) ---
     plt.style.use('dark_background')
     fig, ax = plt.subplots(figsize=(10, 5), facecolor='#0b0e14')
     ax.set_facecolor('#0b0e14')
@@ -155,11 +160,11 @@ async def create_report_data(user, title_prefix, is_periodic=False):
     today_min = [today_hourly[i]/60 for i in hours]
     avg_min = [avg_hourly[i]/60 for i in hours]
 
-    # ラベルを日本語に変更
+    # バーとラインのラベルを日本語化
     ax.bar(hours, today_min, color='#5865F2', label='今日', width=0.7, alpha=0.8, zorder=3)
     ax.plot(hours, avg_min, color='#FEE75C', marker='o', label='14日間の平均', linewidth=2, markersize=4, zorder=4)
     
-    # グラフ内テキストの日本語化とフォント適用
+    # 各テキストに fontproperties=jp_font を適用して日本語化
     ax.set_title(f"アクティビティ分析: @{user.name}", color='white', pad=20, fontsize=15, fontweight='bold', fontproperties=jp_font)
     ax.set_xlabel("時間軸 (24時間)", color='#b9bbbe', fontsize=10, fontproperties=jp_font)
     ax.set_ylabel("活動時間 (分)", color='#b9bbbe', fontsize=10, fontproperties=jp_font)
@@ -171,10 +176,9 @@ async def create_report_data(user, title_prefix, is_periodic=False):
     for spine in ax.spines.values():
         spine.set_visible(False)
     
-    # 凡例へのフォント適用
+    # 凡例（Legend）にも日本語フォントを適用 (凡例のみ prop= になる点に注意)
     ax.legend(frameon=False, loc='upper left', fontsize=9, prop=jp_font)
-    # =================================================================
-
+    
     buf = io.BytesIO()
     plt.savefig(buf, format='png', facecolor='#0b0e14', bbox_inches='tight', dpi=120)
     buf.seek(0)
@@ -183,6 +187,7 @@ async def create_report_data(user, title_prefix, is_periodic=False):
     # --- Embed構成 (ここは日本語) ---
     embed = discord.Embed(title=title_prefix, color=0x5865F2, timestamp=now)
     
+    # 効率の判定
     eff_emoji = "🔥" if efficiency > 110 else "💤" if efficiency < 50 else "📊"
     
     embed.add_field(name="📈 活動効率", value=f"同時刻の14日平均に対して **{efficiency:.1f}%** {eff_emoji}", inline=False)
