@@ -1,0 +1,365 @@
+import discord
+from discord import app_commands
+from discord.ext import commands, tasks
+import datetime
+import os
+import json
+import io
+import asyncio
+import matplotlib.pyplot as plt
+from google.oauth2.service_account import Credentials
+from googleapiclient.discovery import build
+import gspread
+from flask import Flask
+from threading import Thread
+
+# --- Flask ---
+app = Flask('')
+@app.route('/')
+def home(): return "Bot is Online"
+
+def run_flask():
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host='0.0.0.0', port=port)
+
+# --- API連携設定 ---
+TOKEN = os.getenv('DISCORD_TOKEN')
+CALENDAR_ID = os.getenv('CALENDAR_ID')
+SPREADSHEET_KEY = os.getenv('SPREADSHEET_KEY')
+service_account_info = json.loads(os.getenv('GOOGLE_SERVICE_ACCOUNT_JSON'))
+SCOPES = ['https://www.googleapis.com/auth/calendar', 'https://www.googleapis.com/auth/spreadsheets']
+creds = Credentials.from_service_account_info(service_account_info, scopes=SCOPES)
+calendar_service = build('calendar', 'v3', credentials=creds)
+gc = gspread.authorize(creds)
+
+# --- ボット初期設定 ---
+intents = discord.Intents.default()
+intents.presences = True
+intents.members = True
+intents.guilds = True
+intents.message_content = True
+bot = commands.Bot(command_prefix="!", intents=intents)
+
+user_status_start = {}  
+user_configs = {}       
+last_notifications = {} 
+
+def format_time_jp(seconds):
+    h, m = divmod(int(seconds // 60), 60)
+    return f"**{h}**時間 **{m}**分" if h > 0 else f"**{m}**分"
+
+async def load_configs_from_sheets():
+    try:
+        sheet = gc.open_by_key(SPREADSHEET_KEY).sheet1
+        records = sheet.get_all_records()
+        global user_configs
+        user_configs = {f"{r['user_id']}-{r['guild_id']}": int(r['channel_id']) for r in records if r.get('user_id')}
+        print(f"✅ 設定復元完了: {len(user_configs)}件")
+    except Exception as e: print(f"❌ シートロード失敗: {e}")
+
+async def get_activity_data_from_calendar(start_dt, end_dt, user_id):
+    try:
+        events_result = calendar_service.events().list(
+            calendarId=CALENDAR_ID, timeMin=start_dt.isoformat(), timeMax=end_dt.isoformat(), 
+            singleEvents=True, orderBy='startTime'
+        ).execute()
+        events = events_result.get('items', [])
+        hourly_data = {i: 0 for i in range(24)}
+        status_totals = {"Online": 0, "Idle": 0, "DND": 0}
+        active_dates = set() # 活動があった日付を保存
+        
+        target_id_str = f"[{user_id}]"
+        for event in events:
+            summary = event.get('summary', '')
+            if target_id_str not in summary: continue
+            
+            st = "Online" if "オンライン" in summary else "Idle" if "退席中" in summary else "DND" if "取り込み中" in summary else None
+            if not st: continue
+
+            s_str = event['start'].get('dateTime') or event['start'].get('date')
+            e_str = event['end'].get('dateTime') or event['end'].get('date')
+            s = datetime.datetime.fromisoformat(s_str.replace('Z', '+00:00')).astimezone(datetime.timezone(datetime.timedelta(hours=9)))
+            e = datetime.datetime.fromisoformat(e_str.replace('Z', '+00:00')).astimezone(datetime.timezone(datetime.timedelta(hours=9)))
+            
+            curr, limit = max(s, start_dt), min(e, end_dt)
+            if curr < limit:
+                active_dates.add(curr.date()) # 活動日としてカウント
+                status_totals[st] += (limit - curr).total_seconds()
+                it = curr
+                while it < limit:
+                    next_h = (it + datetime.timedelta(hours=1)).replace(minute=0, second=0, microsecond=0)
+                    hourly_data[it.hour] += (min(limit, next_h) - it).total_seconds()
+                    it = min(limit, next_h)
+        return hourly_data, status_totals, len(active_dates)
+    except Exception as e:
+        print(f"❌ カレンダー取得エラー: {e}")
+        return {i: 0 for i in range(24)}, {"Online": 0, "Idle": 0, "DND": 0}, 0
+        
+# --- カウント管理用の辞書をグローバルに定義 ---
+report_counts = {}
+
+async def create_report_data(user, title_prefix, is_periodic=False):
+    now = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=9)))
+    today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    
+    # --- ファイル名管理 ---
+    user_key = f"{user.id}"
+    report_counts[user_key] = report_counts.get(user_key, 0) + 1
+    current_count = report_counts[user_key]
+    # キャッシュ対策のため実行ごとにユニークな名前を生成
+    filename = f"analysis_{user.id}_{'auto' if is_periodic else 'manual'}_{current_count}.png"
+
+    # --- データ取得ロジック ---
+    today_hourly, today_status, _ = await get_activity_data_from_calendar(today_start, now, user.id)
+    
+    # 現在進行中のステータスをリアルタイム反映
+    if user.id in user_status_start:
+        info = user_status_start[user.id]
+        st_eng = {"online": "Online", "idle": "Idle", "dnd": "DND"}.get(info['status'])
+        if st_eng:
+            eff_s = max(info['time'], today_start)
+            if eff_s < now:
+                dur = (now - eff_s).total_seconds()
+                today_status[st_eng] += dur
+                it = eff_s
+                while it < now:
+                    next_h = (it + datetime.timedelta(hours=1)).replace(minute=0, second=0, microsecond=0)
+                    today_hourly[it.hour] += (min(now, next_h) - it).total_seconds()
+                    it = min(now, next_h)
+
+    # 過去14日間の平均データ
+    hist_start = today_start - datetime.timedelta(days=13) 
+    hist_hourly_total, _, _ = await get_activity_data_from_calendar(hist_start, now, user.id)
+    
+    divisor = 14
+    avg_hourly = {i: (hist_hourly_total[i] / divisor) for i in range(24)}
+    
+    # 【正確な分析】現在時刻までの「平均累計」を算出
+    avg_total_until_now_sec = sum(avg_hourly[i] for i in range(now.hour + 1)) 
+    total_today_sec = sum(today_status.values())
+    efficiency = (total_today_sec / avg_total_until_now_sec * 100) if avg_total_until_now_sec > 0 else 0
+
+    # --- グラフ描画 (ここだけ英語) ---
+    plt.style.use('dark_background')
+    fig, ax = plt.subplots(figsize=(10, 5), facecolor='#0b0e14')
+    ax.set_facecolor('#0b0e14')
+    
+    hours = range(24)
+    today_min = [today_hourly[i]/60 for i in hours]
+    avg_min = [avg_hourly[i]/60 for i in hours]
+
+    # Bar: Today / Line: 14-Day Avg
+    ax.bar(hours, today_min, color='#5865F2', label='Today', width=0.7, alpha=0.8, zorder=3)
+    ax.plot(hours, avg_min, color='#FEE75C', marker='o', label='14-Day Average', linewidth=2, markersize=4, zorder=4)
+    
+    # グラフ内テキストを英語に設定
+    ax.set_title(f"Activity Analysis: @{user.name}", color='white', pad=20, fontsize=15, fontweight='bold')
+    ax.set_xlabel("Hour of Day (24h)", color='#b9bbbe', fontsize=10)
+    ax.set_ylabel("Duration (Minutes)", color='#b9bbbe', fontsize=10)
+    
+    ax.set_xticks(hours)
+    ax.tick_params(axis='both', colors='#b9bbbe', labelsize=9)
+    ax.grid(axis='y', color='#2f3136', linestyle='--', alpha=0.3, zorder=0)
+    
+    for spine in ax.spines.values():
+        spine.set_visible(False)
+    
+    ax.legend(frameon=False, loc='upper left', fontsize=9)
+    
+    buf = io.BytesIO()
+    plt.savefig(buf, format='png', facecolor='#0b0e14', bbox_inches='tight', dpi=120)
+    buf.seek(0)
+    plt.close()
+
+    # --- Embed構成 (ここは日本語) ---
+    embed = discord.Embed(title=title_prefix, color=0x5865F2, timestamp=now)
+    
+    # 効率の判定
+    eff_emoji = "🔥" if efficiency > 110 else "💤" if efficiency < 50 else "📊"
+    
+    embed.add_field(name="📈 活動効率", value=f"同時刻の14日平均に対して **{efficiency:.1f}%** {eff_emoji}", inline=False)
+    embed.add_field(name="🟢 オンライン", value=format_time_jp(today_status["Online"]), inline=True)
+    embed.add_field(name="🌙 退席中", value=format_time_jp(today_status["Idle"]), inline=True)
+    embed.add_field(name="⛔ 取り込み中", value=format_time_jp(today_status["DND"]), inline=True)
+    embed.add_field(name="⏱️ 今日の総計", value=format_time_jp(total_today_sec), inline=True)
+    embed.add_field(name="📋 平均の同時刻総計", value=format_time_jp(avg_total_until_now_sec), inline=True)
+    
+    embed.set_footer(text="平均は今日を含む直近14日間の同時刻までのデータから算出")
+    embed.set_image(url=f"attachment://{filename}")
+    
+    return embed, discord.File(buf, filename=filename)
+
+# --- 定期レポートタスクの修正 ---
+@tasks.loop(seconds=10)
+async def daily_report_task():
+    now = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=9)))
+    if now.hour == 23 and now.minute == 57 and 30 <= now.second < 40:
+        for key, channel_id in user_configs.items():
+            try:
+                u_id, g_id = map(int, key.split('-'))
+                guild = bot.get_guild(g_id)
+                member = guild.get_member(u_id)
+                channel = bot.get_channel(channel_id)
+                if member and channel:
+                    # is_periodic=True を指定
+                    embed, file = await create_report_data(member, f"📑 定期レポート: {member.display_name}", is_periodic=True)
+                    await channel.send(embed=embed, file=file)
+                    await asyncio.sleep(5)
+            except: continue
+        await asyncio.sleep(60)
+
+@bot.event
+async def on_ready():
+    await load_configs_from_sheets()
+    await bot.tree.sync()
+    if not daily_report_task.is_running(): daily_report_task.start()
+    print(f"✅ Bot Ready: {bot.user.name}")
+
+@bot.event
+async def on_presence_update(before, after):
+    # ボット自身や、ステータスに変化がない場合は無視
+    if after.bot or before.status == after.status:
+        return
+
+    now = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=9)))
+    
+    # --- カレンダー記録ロジック (現状維持) ---
+    prev = user_status_start.get(after.id)
+    user_status_start[after.id] = {'status': str(after.status), 'time': now}
+    
+    if prev:
+        dur = (now - prev['time']).total_seconds()
+        if prev['status'] in ["online", "idle", "dnd"] and dur >= 60:
+            st_map = {"online": ("オンライン", "10"), "idle": ("退席中", "5"), "dnd": ("取り込み中", "11")}
+            st_n, cid = st_map.get(prev['status'], ("不明", "1"))
+            try:
+                event = {
+                    'summary': f"[{after.id}] {st_n}",
+                    'start': {'dateTime': prev['time'].isoformat(), 'timeZone': 'Asia/Tokyo'},
+                    'end': {'dateTime': now.isoformat(), 'timeZone': 'Asia/Tokyo'},
+                    'colorId': cid
+                }
+                calendar_service.events().insert(calendarId=CALENDAR_ID, body=event).execute()
+            except Exception as e: 
+                print(f"❌ カレンダー記録失敗: {e}")
+
+    # --- ステータス通知送信ロジック (改善版) ---
+    st_d = {
+        "online": "🟢 **オンライン**", 
+        "idle": "🌙 **退席中**", 
+        "dnd": "⛔ **取り込み中**", 
+        "offline": "⚪ **オフライン**"
+    }
+
+    for guild in bot.guilds:
+        # スプレッドシートから読み込んだ設定があるか確認
+        c_id = user_configs.get(f"{after.id}-{guild.id}")
+        if not c_id: 
+            continue
+        
+        # 短時間の連投防止 (3秒以内の連続変化は無視)
+        lock_key = f"{after.id}-{guild.id}"
+        if lock_key in last_notifications and (now - last_notifications[lock_key]).total_seconds() < 3: 
+            continue
+            
+        last_notifications[lock_key] = now
+        channel = bot.get_channel(c_id)
+        
+        if channel:
+            try:
+                # 前回のステータスも含めて送ると分かりやすい
+                old_st = st_d.get(str(before.status), "⚪ オフライン")
+                new_st = st_d.get(str(after.status), "⚪ オフライン")
+                await channel.send(f"🔔 **{after.display_name}**： {old_st} ➡ {new_st}")
+            except discord.Forbidden:
+                print(f"⚠️ 権限不足: {guild.name} の {channel.name} でメッセージが送れません")
+            except Exception as e:
+                print(f"❌ 通知エラー: {e}")
+                
+@bot.tree.command(name="register", description="通知先登録")
+async def register(interaction: discord.Interaction, user: discord.Member, channel: discord.TextChannel):
+    await interaction.response.defer(ephemeral=True)
+    try:
+        sheet = gc.open_by_key(SPREADSHEET_KEY).sheet1
+        records = sheet.get_all_records()
+        row = next((i for i, r in enumerate(records, 2) if str(r['user_id']) == str(user.id) and str(r['guild_id']) == str(interaction.guild_id)), None)
+        if row: sheet.update_cell(row, 3, str(channel.id))
+        else: sheet.append_row([str(user.id), str(interaction.guild_id), str(channel.id), user.display_name])
+        user_configs[f"{user.id}-{interaction.guild_id}"] = channel.id
+        await interaction.followup.send(f"✅ {user.display_name} の通知設定完了")
+    except: await interaction.followup.send(f"❌ 登録エラー")
+
+@bot.tree.command(name="status", description="現在状況")
+async def status(interaction: discord.Interaction, member: discord.Member = None):
+    target = member or interaction.user
+    now = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=9)))
+    c_map = {"online": 0x57F287, "idle": 0xFEE75C, "dnd": 0xED4245, "offline": 0x95A5A6}
+    l_map = {"online": "🟢 オンライン", "idle": "🌙 退席中", "dnd": "⛔ 取り込み中", "offline": "⚪ オフライン"}
+    embed = discord.Embed(title=f"Status: {target.display_name}", color=c_map.get(str(target.status), 0x95A5A6))
+    embed.add_field(name="現在", value=l_map.get(str(target.status), "⚪ オフライン"), inline=True)
+    if target.id in user_status_start:
+        info = user_status_start[target.id]
+        embed.add_field(name="開始時刻", value=info['time'].strftime("%H:%M:%S"), inline=True)
+        embed.add_field(name="継続時間", value=format_time_jp((now - info['time']).total_seconds()), inline=False)
+    await interaction.response.send_message(embed=embed)
+
+@bot.tree.command(name="report", description="レポート作成")
+async def report(interaction: discord.Interaction, member: discord.Member = None):
+    # ★ここが重要：関数の「一番最初」に持ってくる
+    await interaction.response.defer() 
+    
+    target = member or interaction.user
+    try:
+        # デフォルトは is_periodic=False
+        embed, file = await create_report_data(target, f"📑 レポート: {target.display_name}")
+        await interaction.followup.send(embed=embed, file=file)
+    except Exception as e:
+        print(f"❌ エラー発生: {e}")
+        try:
+            await interaction.followup.send("❌ データ取得に時間がかかりすぎたか、エラーが発生しました。")
+        except:
+            pass
+
+@bot.tree.command(name="graph_test", description="【開発用】グラフ生成ロジックのテスト出力（自身のみ）")
+async def graph_test(interaction: discord.Interaction):
+    """
+    現在のGoogleカレンダーのデータおよび内部バッファから、
+    どのような数値が計算されてグラフ化されているかを数値テキスト付きで出力するデバッグコマンド
+    """
+    await interaction.response.defer(ephemeral=True) # 他のユーザーに見られないよう隠して実行
+    
+    user = interaction.user
+    now = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=9)))
+    today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    
+    try:
+        # 1. カレンダーからの生データ取得
+        today_hourly, today_status, _ = await get_activity_data_from_calendar(today_start, now, user.id)
+        
+        raw_status_str = f"【カレンダー生データ】\nOnline: {format_time_jp(today_status['Online'])}, Idle: {format_time_jp(today_status['Idle'])}, DND: {format_time_jp(today_status['DND'])}"
+        
+        # 2. 内部バッファ（リアルタイム反映）の適用状態を確認
+        buffer_str = "未適用（メモリに開始データがありません）"
+        if user.id in user_status_start:
+            info = user_status_start[user.id]
+            buffer_str = f"適用あり -> ステータス: {info['status']}, 開始: {info['time'].strftime('%H:%M:%S')}"
+            
+        # 3. 通常通りのレポート生成を呼び出し
+        embed, file = await create_report_data(user, f"🧪 グラフテスト: {user.display_name}")
+        
+        # 4. デバッグ用のテキスト情報をEmbedに追加
+        embed.add_field(
+            name="🤖 デバッグ情報（データ検証用）", 
+            value=f"{raw_status_str}\n\n【現在進行中のバッファ】\n{buffer_str}\n\n【判定時刻】\nサーバー時間(JST): {now.strftime('%Y-%m-%d %H:%M:%S')}", 
+            inline=False
+        )
+        
+        await interaction.followup.send(embed=embed, file=file, ephemeral=True)
+        
+    except Exception as e:
+        print(f"❌ グラフテストエラー: {e}")
+        await interaction.followup.send(f"❌ テスト中にエラーが発生しました:\n`{e}`", ephemeral=True)
+
+if __name__ == "__main__":
+    Thread(target=run_flask).start()
+    bot.run(TOKEN)
